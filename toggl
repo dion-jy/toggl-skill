@@ -175,8 +175,9 @@ def cmd_list(args):
 
 def cmd_today(args):
     now = datetime.now(timezone.utc)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=9)  # KST midnight in UTC
-    entries = _get(f"me/time_entries?start_date={start.isoformat()}&end_date={now.isoformat()}")
+    kst = timezone(timedelta(hours=9))
+    start = now.astimezone(kst).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    entries = _get(f"me/time_entries?since={int(start.timestamp())}")
     if not entries:
         print("  No time entries today.")
         return
@@ -207,7 +208,7 @@ def cmd_today(args):
 def cmd_summary(args):
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=args.days)
-    entries = _get(f"me/time_entries?start_date={start.isoformat()}&end_date={now.isoformat()}")
+    entries = _get(f"me/time_entries?since={int(start.timestamp())}")
     if not entries:
         print(f"  No entries last {args.days}d.")
         return
