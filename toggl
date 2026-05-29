@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+Toggl Track Skill — Read/write time entries via Toggl REST API v9.
+
+Setup:
+  1. Get API Token: track.toggl.com → Profile Settings → API Token (reveal+copy)
+  2. Run: toggl link <api_token>
+
+Usage:
+  toggl list                # project list
+  toggl today               # 오늘 time entries
+  toggl summary [--days N]  # period stat (default 7d)
+  toggl current             # 현재 진행 중 timer
+  toggl start "<desc>" [--project <name>]
+  toggl stop                # 현재 timer stop
+  toggl whoami              # 본인 정보
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+# --- Config ---
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_user_path = os.path.join(_script_dir, ".user")
+
+BASE = "https://api.track.toggl.com/api/v9"
+
+
+def _auth_header():
+    user = _load_user()
+    if not user or not user.get("api_token"):
+        print("Not linked. Run 'toggl link <api_token>' first.")
+        sys.exit(1)
+    token = user["api_token"]
+    raw = f"{token}:api_token".encode()
+    return "Basic " + base64.b64encode(raw).decode()
+
+
+def _headers():
+    return {
+        "Authorization": _auth_header(),
+        "Content-Type": "application/json",
+    }
+
+
+def _get(path):
+    req = Request(f"{BASE}/{path}", headers=_headers())
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _post(path, data):
+    body = json.dumps(data).encode()
+    req = Request(f"{BASE}/{path}", data=body, headers=_headers(), method="POST")
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _patch(path, data):
+    body = json.dumps(data).encode()
+    req = Request(f"{BASE}/{path}", data=body, headers=_headers(), method="PATCH")
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _put(path, data):
+    body = json.dumps(data).encode()
+    req = Request(f"{BASE}/{path}", data=body, headers=_headers(), method="PUT")
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def _save_user(api_token=None, workspace_id=None):
+    data = {}
+    if os.path.exists(_user_path):
+        with open(_user_path) as f:
+            data = json.load(f)
+    if api_token:
+        data["api_token"] = api_token
+    if workspace_id:
+        data["workspace_id"] = workspace_id
+    fd = os.open(_user_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+
+
+def _load_user():
+    if not os.path.exists(_user_path):
+        return None
+    with open(_user_path) as f:
+        return json.load(f)
+
+
+def _workspace_id():
+    user = _load_user()
+    if user and user.get("workspace_id"):
+        return user["workspace_id"]
+    # Auto-detect
+    me = _get("me")
+    wid = me.get("default_workspace_id")
+    if wid:
+        _save_user(workspace_id=wid)
+    return wid
+
+
+def _resolve_project(name):
+    wid = _workspace_id()
+    projects = _get(f"workspaces/{wid}/projects")
+    for p in projects:
+        if p["name"].lower() == name.lower():
+            return p
+    for p in projects:
+        if name.lower() in p["name"].lower():
+            return p
+    return None
+
+
+def _fmt_duration(seconds):
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+# --- Commands ---
+
+def cmd_link(args):
+    if not args.token:
+        print("  Usage: toggl link <api_token>")
+        print("  Get token from track.toggl.com → Profile Settings → API Token")
+        return
+    _save_user(api_token=args.token)
+    try:
+        me = _get("me")
+        wid = me.get("default_workspace_id")
+        _save_user(workspace_id=wid)
+        print(f"  Linked! email={me.get('email')} workspace={wid}")
+    except HTTPError as e:
+        print(f"  Failed: {e.code} {e.read().decode()[:200]}")
+
+
+def cmd_whoami(args):
+    user = _load_user()
+    if not user:
+        print("  Not linked.")
+        return
+    try:
+        me = _get("me")
+        print(f"  email:    {me.get('email')}")
+        print(f"  fullname: {me.get('fullname')}")
+        print(f"  ws_id:    {me.get('default_workspace_id')}")
+        print(f"  timezone: {me.get('timezone')}")
+    except HTTPError as e:
+        print(f"  HTTP {e.code}")
+
+
+def cmd_list(args):
+    wid = _workspace_id()
+    projects = _get(f"workspaces/{wid}/projects")
+    if not projects:
+        print("  No projects.")
+        return
+    for p in projects:
+        active = "" if p.get("active", True) else " (archived)"
+        print(f"  {p['id']:>10}  {p['name']}{active}")
+
+
+def cmd_today(args):
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=9)  # KST midnight in UTC
+    entries = _get(f"me/time_entries?start_date={start.isoformat()}&end_date={now.isoformat()}")
+    if not entries:
+        print("  No time entries today.")
+        return
+    total = 0
+    by_project = {}
+    wid = _workspace_id()
+    projects = {p["id"]: p["name"] for p in _get(f"workspaces/{wid}/projects")}
+    for e in entries:
+        dur = e.get("duration", 0)
+        if dur < 0:  # running timer
+            start_t = datetime.fromisoformat(e["start"].replace("Z", "+00:00"))
+            dur = int((now - start_t).total_seconds())
+            running = " (running)"
+        else:
+            running = ""
+        total += dur
+        pname = projects.get(e.get("project_id"), "no project")
+        by_project[pname] = by_project.get(pname, 0) + dur
+        desc = e.get("description", "")[:50]
+        print(f"  {_fmt_duration(dur):>7}  {pname:<20} {desc}{running}")
+    print(f"  ─── total: {_fmt_duration(total)}")
+    if by_project:
+        print("\n  by project:")
+        for pname, dur in sorted(by_project.items(), key=lambda x: -x[1]):
+            print(f"    {_fmt_duration(dur):>7}  {pname}")
+
+
+def cmd_summary(args):
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=args.days)
+    entries = _get(f"me/time_entries?start_date={start.isoformat()}&end_date={now.isoformat()}")
+    if not entries:
+        print(f"  No entries last {args.days}d.")
+        return
+    wid = _workspace_id()
+    projects = {p["id"]: p["name"] for p in _get(f"workspaces/{wid}/projects")}
+    by_project = {}
+    total = 0
+    for e in entries:
+        dur = e.get("duration", 0)
+        if dur < 0:
+            start_t = datetime.fromisoformat(e["start"].replace("Z", "+00:00"))
+            dur = int((now - start_t).total_seconds())
+        total += dur
+        pname = projects.get(e.get("project_id"), "no project")
+        by_project[pname] = by_project.get(pname, 0) + dur
+    print(f"  Last {args.days}d total: {_fmt_duration(total)}")
+    print("\n  by project:")
+    for pname, dur in sorted(by_project.items(), key=lambda x: -x[1]):
+        print(f"    {_fmt_duration(dur):>7}  {pname}")
+
+
+def cmd_current(args):
+    e = _get("me/time_entries/current")
+    if not e:
+        print("  No timer running.")
+        return
+    wid = _workspace_id()
+    projects = {p["id"]: p["name"] for p in _get(f"workspaces/{wid}/projects")}
+    pname = projects.get(e.get("project_id"), "no project")
+    start_t = datetime.fromisoformat(e["start"].replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    dur = int((now - start_t).total_seconds())
+    print(f"  Running: {e.get('description', '(no desc)')} ({pname}) — {_fmt_duration(dur)}")
+
+
+def cmd_start(args):
+    wid = _workspace_id()
+    project_id = None
+    if args.project:
+        proj = _resolve_project(args.project)
+        if proj:
+            project_id = proj["id"]
+        else:
+            print(f"  Project '{args.project}' not found.")
+            return
+    now = datetime.now(timezone.utc).isoformat()
+    data = {
+        "created_with": "toggl-skill",
+        "description": args.desc,
+        "start": now,
+        "duration": -1,
+        "workspace_id": wid,
+    }
+    if project_id:
+        data["project_id"] = project_id
+    r = _post(f"workspaces/{wid}/time_entries", data)
+    print(f"  Started: {r.get('description')} (id={r.get('id')})")
+
+
+def cmd_stop(args):
+    e = _get("me/time_entries/current")
+    if not e:
+        print("  No timer running.")
+        return
+    wid = _workspace_id()
+    eid = e["id"]
+    r = _patch(f"workspaces/{wid}/time_entries/{eid}/stop", {})
+    print(f"  Stopped: {r.get('description')}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="toggl", description="Toggl Track agent skill")
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("link")
+    p.add_argument("token", nargs="?", default=None)
+
+    sub.add_parser("whoami")
+    sub.add_parser("list", help="project list")
+    sub.add_parser("today")
+    sub.add_parser("current")
+
+    p = sub.add_parser("summary")
+    p.add_argument("--days", type=int, default=7)
+
+    p = sub.add_parser("start")
+    p.add_argument("desc")
+    p.add_argument("--project", default=None)
+
+    sub.add_parser("stop")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return
+
+    cmds = {
+        "link": cmd_link, "whoami": cmd_whoami, "list": cmd_list,
+        "today": cmd_today, "summary": cmd_summary, "current": cmd_current,
+        "start": cmd_start, "stop": cmd_stop,
+    }
+    cmds[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
